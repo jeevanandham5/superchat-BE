@@ -22,7 +22,7 @@ io.on("connection", (socket) => {
   });
   socket.on("send_message", (data) => {
     socket.to(data.room).emit("receive_massage", data);
-    console.log(data);
+    
   });
 
   socket.on("disconnect", () => {
