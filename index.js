@@ -1,6 +1,7 @@
 const express = require("express");
 const app = express();
 const http = require("http");
+const https = require("https");
 const cors = require("cors");
 const { Server } = require("socket.io");
 app.use(cors());
@@ -16,6 +17,77 @@ const io = new Server(server, {
 });
 app.get("/", (req, res, next) => {
   res.send("<h1>iam working :-)</h1>");
+});
+
+// ICE servers for calls. STUN alone fails behind most mobile carriers, so
+// when CF_TURN_KEY_ID / CF_TURN_API_TOKEN are set we hand out short-lived
+// Cloudflare TURN credentials that relay the call when a direct path is blocked.
+const FALLBACK_ICE = [
+  { urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] },
+];
+const TURN_TTL_SECONDS = 24 * 60 * 60;
+// reuse credentials for half their lifetime so a call never outlives them
+const TURN_REUSE_MS = (TURN_TTL_SECONDS / 2) * 1000;
+let turnCache = { iceServers: null, fetchedAt: 0 };
+
+const fetchTurnServers = () =>
+  new Promise((resolve, reject) => {
+    const body = JSON.stringify({ ttl: TURN_TTL_SECONDS });
+    const req = https.request(
+      {
+        hostname: "rtc.live.cloudflare.com",
+        path: `/v1/turn/keys/${process.env.CF_TURN_KEY_ID}/credentials/generate-ice-servers`,
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.CF_TURN_API_TOKEN}`,
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+        },
+        timeout: 5000,
+      },
+      (res) => {
+        let raw = "";
+        res.on("data", (chunk) => (raw += chunk));
+        res.on("end", () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            return reject(new Error(`Cloudflare TURN responded ${res.statusCode}`));
+          }
+          try {
+            const { iceServers } = JSON.parse(raw);
+            // browsers block port 53, so those URLs only add a timeout
+            resolve(
+              iceServers.map((server) => ({
+                ...server,
+                urls: [].concat(server.urls).filter((url) => !/:53(\?|$)/.test(url)),
+              }))
+            );
+          } catch (err) {
+            reject(err);
+          }
+        });
+      }
+    );
+    req.on("timeout", () => req.destroy(new Error("Cloudflare TURN timed out")));
+    req.on("error", reject);
+    req.end(body);
+  });
+
+app.get("/ice-servers", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (!process.env.CF_TURN_KEY_ID || !process.env.CF_TURN_API_TOKEN) {
+    return res.json({ iceServers: FALLBACK_ICE, relay: false });
+  }
+  if (turnCache.iceServers && Date.now() - turnCache.fetchedAt < TURN_REUSE_MS) {
+    return res.json({ iceServers: turnCache.iceServers, relay: true });
+  }
+  try {
+    const iceServers = await fetchTurnServers();
+    turnCache = { iceServers, fetchedAt: Date.now() };
+    res.json({ iceServers, relay: true });
+  } catch (err) {
+    console.error("TURN credentials failed:", err.message);
+    res.json({ iceServers: FALLBACK_ICE, relay: false });
+  }
 });
 
 const roomSize = (room) => io.sockets.adapter.rooms.get(room)?.size || 0;
